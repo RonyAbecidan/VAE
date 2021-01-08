@@ -140,7 +140,7 @@ class Decoder_Linear_Conv(pl.LightningModule):
         self.in_channel = in_channel
         self.modules = [nn.Linear(self.latent_dim,self.latent_dim//2),
                         nn.ReLU(),
-                        nn.ConvTranspose2d(self.latent_dim,hiddens[0],init, 1, 0), #init*init
+                        nn.ConvTranspose2d(self.latent_dim//2,hiddens[0],init, 1, 0), #init*init
                         nn.SELU()]
 
         for i in range(1, len(hiddens) - 1):
@@ -166,16 +166,16 @@ class Decoder_Linear_Conv(pl.LightningModule):
         return result
 
 
-def weights_init(m):
-    classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
-        nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif classname.find('BatchNorm') != -1:
-        nn.init.normal_(m.weight.data, 1.0, 0.02)
-        nn.init.constant_(m.bias.data, 0)
-    elif classname.find('Linear') != -1:
-        nn.init.normal_(m.weight.data, 0, 0.08)
-        nn.init.constant_(m.bias.data, 0)
+# def weights_init(m):
+#     classname = m.__class__.__name__
+#     if classname.find('Conv') != -1:
+#         nn.init.normal_(m.weight.data, 0.0, 0.02)
+#     elif classname.find('BatchNorm') != -1:
+#         nn.init.normal_(m.weight.data, 1.0, 0.02)
+#         nn.init.constant_(m.bias.data, 0)
+#     elif classname.find('Linear') != -1:
+#         nn.init.normal_(m.weight.data, 0, 0.02)
+#         nn.init.constant_(m.bias.data, 0)
 
 Decoders=[Decoder_MLP(latent_dim=100, in_channel=3, im_size=64, hiddens=[256,128,64,32]),
           Decoder_Conv(latent_dim=100, in_channel=3, im_size=64, hiddens=[512,256,128],init=8),
@@ -183,16 +183,23 @@ Decoders=[Decoder_MLP(latent_dim=100, in_channel=3, im_size=64, hiddens=[256,128
 
 class MVAE(pl.LightningModule):
 
-    def __init__(self,train_loader,decoders,i=0):
+    def __init__(self,train_loader,decoders,eps=0.1,i=0):
         super(MVAE, self).__init__()
+        self.eps=eps
         self.encoder = Encoder(self.latent_dim)
         self.decoders=decoders
+        self.nb_decoders=len(decoders)
         self.latent_dim=self.decoders[0].latent_dim
         self.im_size = self.decoders[0].im_size
         self.in_channel=self.decoders[0].in_channel
+        self.history=torch.zeros(self.nb_decoders)
+        self.NbDraws=torch.zeros(self.nb_decoders)
+        self.strategy_path=[]
         self.train_loader = train_loader
+        self.best_rewards=[]
         # self.fixed_noise = torch.randn(64, self.latent_dim, 1, 1)
-        self.i = i
+        self.i=i #counter of epochs
+        self.t=t #counter of steps
 
     def reparameterize(self, mu, logvar):
         """
@@ -223,10 +230,13 @@ class MVAE(pl.LightningModule):
         # Optimizers
 
     def configure_optimizers(self):
-        optimizerE = torch.optim.Adam(self.encoder.parameters(), lr=2 * 10 ** (-4), betas=(0.5, 0.9))
-        optimizerD = torch.optim.Adam(self.decoder.parameters(), lr=2 * 10 ** (-4), betas=(0.5, 0.9))
+        opt_list=[]
+        for decoder in self.decoders:
+            optimizer = torch.optim.Adam(decoder.parameters(), lr=10 ** (-4), betas=(0.5, 0.9))
+            opt_list.add(optimizer)
+
         # return the list of optimizers and second empty list is for schedulers (if any)
-        return [optimizerE, optimizerD], []
+        return opt_list, []
 
     # Calls after prepare_data for DataLoader
     def train_dataloader(self):
@@ -235,51 +245,76 @@ class MVAE(pl.LightningModule):
     def forward(self, x):
         return self.encoder(x)
 
-    def display(self):
-        fake = self.decoder(self.fixed_noise).detach()
-        plt.figure(figsize=(10, 10))
-        plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
-        plt.savefig(f'VAE_current_result.png')
-        print('OK')
-        plt.close('all')
+    # def display(self):
+    #     fake = self.decoder(self.fixed_noise).detach()
+    #     plt.figure(figsize=(10, 10))
+    #     plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
+    #     plt.savefig(f'VAE_current_result.png')
+    #     print('OK')
+    #     plt.close('all')
 
     # Training Loop
     def training_step(self, batch, batch_idx, optimizer_idx):
         # batch returns x and y tensors
         real_images, _ = batch
-        self.cpt += 1
 
-        self.fixed_noise = self.fixed_noise.type_as(real_images[0])
-        # if self.cpt==0:
+        #for the gpu
+        if self.t==0:
+            self.fixed_noise = self.fixed_noise.type_as(real_images[0])
 
-        #   self.logscale=self.logscale.type_as(real_images[0])
-
+        #encoding
         mu, log_var = self.encoder(real_images)
         z = self.reparameterize(mu, log_var)
 
+        with torch.no_grad():
+            best_reward=10**(8)
+            for decoder in self.decoders:
+                recons=decoder(z)
+                reward=self.loss_function(recons, real_images, mu, log_var)['Reconstruction_Loss']
+                if reward<best_reward:
+                    best_reward=reward
+
+            self.best_rewards.append(best_reward)
+
+        #initialization
+        if self.t<self.nb_decoders:
+            id_to_choose=self.t
+            self.NbDraws[id_to_choose]+=1
+        #eps-greedy behaviour
+        else:
+            u=np.random.random()
+            if u<self.eps:
+                id_to_choose=np.random.randint(self.nb_decoders)
+                self.NbDraws[id_to_choose] += 1
+            else:
+                average_previous_rewards=self.history/self.NbDraws
+                id_to_choose=np.argmin(average_previous_rewards)
+
         # Encoder-Decoder
-        recons = self.decoder(z)
-
+        recons = self.decoder[id_to_choose](z)
         step_dict = self.loss_function(recons, real_images, mu, log_var)
-
+        self.history[id_to_choose]+=step_dict['Reconstruction_Loss']
+        self.strategy_path.append(step_dict['Reconstruction_Loss'])
         total_loss = step_dict['total_loss']
 
-        # Encoder
-        # {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
-        output = OrderedDict({
-            'loss': total_loss,
-            'progress_bar': step_dict,
-            'log': step_dict
-        })
+        if optimizer_idx==id_to_choose:
+            # {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
+            output = OrderedDict({
+                'loss': total_loss,
+                'progress_bar': step_dict,
+                'log': step_dict
+            })
+
+            return output
 
         if self.cpt % 100 == 0:
-            fake = self.decoder(self.fixed_noise).detach()
+            fake = self.decoder[id_to_choose](self.fixed_noise).detach()
             plt.figure(figsize=(10, 10))
             plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
-            plt.savefig(f'VAE_current_result.png')
+            plt.savefig(f'VAE_current_result_decoder={id_to_choose}.png')
             plt.close('all')
 
-        return output
+        self.t += 1
 
     # calls after every epoch ends
     def on_epoch_end(self):
