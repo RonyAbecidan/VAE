@@ -1,25 +1,37 @@
 import torch
+import numpy as np
 from torch import nn
-from torch.nn import functional as F
-
+import torch.nn.functional as F
+from torch.utils import data
+from torch.autograd import Variable
+from torch.utils.data import DataLoader, random_split
+from torchvision import datasets, transforms, utils
+from collections import OrderedDict
+import matplotlib.pyplot as plt
+import warnings
+import pytorch_lightning as pl
+import h5py as h5
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
 
 # Build Encoder
 class Encoder(pl.LightningModule):
 
-    def __init__(self, latent_dim,im_size=64,in_channel=3,hiddens=[64,128,256,512]):
+    def __init__(self,latent_dim,im_size=32,in_channel=3,hiddens=[128,256,512]):
         super(Encoder, self).__init__()
 
         self.latent_dim = latent_dim
         self.im_size=im_size
         self.in_channel=in_channel
         self.hiddens=hiddens
-        self.modules=[nn.Conv2d(in_channel,hiddens[0], kernel_size=3, stride=2, padding=1),  # hiddens[0]*im_size/2xim_size/2
+        self.modules=[nn.Conv2d(self.in_channel,hiddens[0], kernel_size=3, stride=2, padding=1),  # hiddens[0]*im_size/2xim_size/2
                       nn.ReLU(),
                       nn.BatchNorm2d(hiddens[0])]
 
         for i in range(1,len(hiddens)):
             # hiddens[i]*(im_size/2^i)^2
-            self.modules.append(nn.Conv2d(hiddens[i-1],hiddens[i], kernel_size=3, stride=2, padding=1)
+            self.modules.append(nn.Conv2d(hiddens[i-1],hiddens[i], kernel_size=3, stride=2, padding=1))
             self.modules.append(nn.ReLU())
             self.modules.append(nn.BatchNorm2d(self.hiddens[i]))
 
@@ -62,15 +74,15 @@ class Decoder_MLP(pl.LightningModule):
         self.hiddens=hiddens
         self.modules=[nn.Linear(latent_dim,hiddens[0])]
 
-        for i in range(1,len(hiddens)-1):
-            self.module.append(nn.ReLU())
+        for i in range(1,len(hiddens)):
+            self.modules.append(nn.ReLU())
             self.modules.append(nn.Linear(hiddens[i-1],hiddens[i]))
 
         self.modules.append(nn.Tanh())
-        self.modules.append(nn.Linear(hiddens[-1],self.im_size*self.im_size))
+        self.modules.append(nn.Linear(hiddens[-1],self.in_channel*self.im_size*self.im_size))
         self.modules.append(nn.Sigmoid())
 
-        self.decode=nn.Sequential(*self.modules)
+        self.decode=nn.ModuleList(self.modules)
 
     def forward(self, z):
         """
@@ -79,17 +91,20 @@ class Decoder_MLP(pl.LightningModule):
         :param z: (Tensor) [B x D]
         :return: (Tensor) [B x C x H x W]
         """
+        z=z.view(-1,self.latent_dim)
+        for layer in self.decode:
+            z = layer(z)
+            
+        
+        z = z.view(-1,self.in_channel,self.im_size,self.im_size)
 
-        out = self.decode(z)
-        out = out.view(-1,self.in_channel,self.im_size,self.im_size)
-
-        return out
+        return z
 
 # Build Decoder
 class Decoder_Conv(pl.LightningModule):
 
     def __init__(self, latent_dim=4, in_channel=3, im_size=64, hiddens=[512,256,128,64],init=4):
-        super(Decoder_MLP, self).__init__()
+        super(Decoder_Conv, self).__init__()
 
         assert (2**(len(hiddens))*init==im_size),"Take care about the architecture of your decoder, there is something wrong"
 
@@ -99,10 +114,10 @@ class Decoder_Conv(pl.LightningModule):
         self.in_channel = in_channel
         self.modules = [nn.ConvTranspose2d(self.latent_dim,hiddens[0],init, 1, 0), #init*init
                        nn.ReLU(),
-                       nn.BatchNorm2d(self.im_size * 8)]
+                       nn.BatchNorm2d(hiddens[0])]
 
-        for i in range(1, len(hiddens) - 1):
-            self.modules.append(nn.ConvTranspose2d(hiddens[i-1],hiddens[i-1], 4, 2, 1)) #im_size=2^(2+i)
+        for i in range(1, len(hiddens)):
+            self.modules.append(nn.ConvTranspose2d(hiddens[i-1],hiddens[i], 4, 2, 1)) #im_size=2^(2+i)
             self.modules.append(nn.ReLU())
             self.modules.append(nn.BatchNorm2d(hiddens[i]))
 
@@ -110,7 +125,7 @@ class Decoder_Conv(pl.LightningModule):
         self.modules.append(nn.ConvTranspose2d(hiddens[-1],self.in_channel, 4, 2, 1)) #im_size*im_size
         self.modules.append(nn.Sigmoid())
 
-        self.decode = nn.Sequential(*self.modules)
+        self.decode = nn.ModuleList(self.modules)
 
     def forward(self, z):
         """
@@ -120,17 +135,18 @@ class Decoder_Conv(pl.LightningModule):
         :return: (Tensor) [B x C x H x W]
         """
 
-        z = z.view(-1,self.latent_dim, 1, 1)
-        result = self.decode(z)
-
-        return result
+        z = z.view(-1,self.latent_dim,1,1)
+        for layer in self.decode:
+            z = layer(z)
+           
+        return z
 
 
 # Build Decoder
 class Decoder_Linear_Conv(pl.LightningModule):
 
     def __init__(self, latent_dim=4, in_channel=3, im_size=64, hiddens=[512,256,128,64],init=4):
-        super(Decoder_MLP, self).__init__()
+        super(Decoder_Linear_Conv, self).__init__()
 
         assert (2**(len(hiddens))*init==im_size),"Take care about the architecture of your decoder, there is something wrong"
 
@@ -143,14 +159,14 @@ class Decoder_Linear_Conv(pl.LightningModule):
                         nn.ConvTranspose2d(self.latent_dim//2,hiddens[0],init, 1, 0), #init*init
                         nn.SELU()]
 
-        for i in range(1, len(hiddens) - 1):
-            self.modules.append(nn.ConvTranspose2d(hiddens[i-1],hiddens[i-1], 4, 2, 1)) #im_size=2^(2+i)
+        for i in range(1, len(hiddens)):
+            self.modules.append(nn.ConvTranspose2d(hiddens[i-1],hiddens[i], 4, 2, 1)) #im_size=2^(2+i)
             self.modules.append(nn.SELU())
 
         self.modules.append(nn.ConvTranspose2d(hiddens[-1],self.in_channel, 4, 2, 1)) #im_size*im_size
         self.modules.append(nn.Sigmoid())
 
-        self.decode = nn.Sequential(*self.modules)
+        self.decode = nn.ModuleList(self.modules)
 
     def forward(self, z):
         """
@@ -160,46 +176,49 @@ class Decoder_Linear_Conv(pl.LightningModule):
         :return: (Tensor) [B x C x H x W]
         """
 
-        z = z.view(-1,self.latent_dim, 1, 1)
-        result = self.decode(z)
+        z = z.view(-1,self.latent_dim)
+        for i,layer in enumerate(self.decode):
+            if i==2:
+                z=z.view(-1,self.latent_dim//2,1,1)
+                
+            z=layer(z)
 
-        return result
+        return z
 
 
-# def weights_init(m):
-#     classname = m.__class__.__name__
-#     if classname.find('Conv') != -1:
-#         nn.init.normal_(m.weight.data, 0.0, 0.02)
-#     elif classname.find('BatchNorm') != -1:
-#         nn.init.normal_(m.weight.data, 1.0, 0.02)
-#         nn.init.constant_(m.bias.data, 0)
-#     elif classname.find('Linear') != -1:
-#         nn.init.normal_(m.weight.data, 0, 0.02)
-#         nn.init.constant_(m.bias.data, 0)
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 1)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 0, 1)
+        nn.init.constant_(m.bias.data, 0)
+    elif classname.find('Linear') != -1:
+        nn.init.normal_(m.weight.data, 0, 1)
+        nn.init.constant_(m.bias.data, 0)
 
-Decoders=[Decoder_MLP(latent_dim=100, in_channel=3, im_size=64, hiddens=[256,128,64,32]),
-          Decoder_Conv(latent_dim=100, in_channel=3, im_size=64, hiddens=[512,256,128],init=8),
-          Decoder_Linear_Conv(latent_dim=100, in_channel=3, im_size=64, hiddens=[512,256,128,64],init=4)]
+# Decoders=nn.ModuleList([Decoder_MLP(latent_dim=100, in_channel=1, im_size=32, hiddens=[256,512]),
+#           Decoder_Conv(latent_dim=100, in_channel=1, im_size=32, hiddens=[512,256,128],init=4),
+#           Decoder_Linear_Conv(latent_dim=100, in_channel=1, im_size=32, hiddens=[512,256,128,64],init=2)])
 
-class MVAE(pl.LightningModule):
-
+class MabVAE(pl.LightningModule):
     def __init__(self,train_loader,decoders,eps=0.1,i=0):
-        super(MVAE, self).__init__()
+        super(MabVAE, self).__init__()
         self.eps=eps
-        self.encoder = Encoder(self.latent_dim)
         self.decoders=decoders
         self.nb_decoders=len(decoders)
         self.latent_dim=self.decoders[0].latent_dim
         self.im_size = self.decoders[0].im_size
         self.in_channel=self.decoders[0].in_channel
+        self.encoder = Encoder(latent_dim=self.latent_dim,in_channel=decoders[0].in_channel,im_size=self.im_size)
         self.history=torch.zeros(self.nb_decoders)
         self.NbDraws=torch.zeros(self.nb_decoders)
         self.strategy_path=[]
         self.train_loader = train_loader
         self.best_rewards=[]
-        # self.fixed_noise = torch.randn(64, self.latent_dim, 1, 1)
+        self.latent = torch.randn(64, self.latent_dim, 1, 1)
         self.i=i #counter of epochs
-        self.t=t #counter of steps
+        self.t=1 #counter of steps
 
     def reparameterize(self, mu, logvar):
         """
@@ -209,8 +228,8 @@ class MVAE(pl.LightningModule):
         :param logvar: (Tensor) Standard deviation of the latent Gaussian [B x D]
         :return: (Tensor) [B x D]
         """
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
+        std = torch.exp(0.5 * logvar).type_as(mu)
+        eps = torch.randn_like(std).type_as(mu)
         return eps * std + mu
 
     def loss_function(self, recons, input, mu, log_var):
@@ -219,7 +238,7 @@ class MVAE(pl.LightningModule):
         KL(N(\mu, \sigma), N(0, 1)) = \log \frac{1}{\sigma} + \frac{\sigma^2 + \mu^2}{2} - \frac{1}{2}
         """
         recon_loss = F.binary_cross_entropy(recons.view(-1, self.im_size, self.im_size), input.view(-1, self.im_size, self.im_size), reduction='sum')
-
+        
         # minimize kl = maximize -kl
         weight = (len(self.train_loader.dataset) / (recons.size(0)))
         kld_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
@@ -232,9 +251,10 @@ class MVAE(pl.LightningModule):
     def configure_optimizers(self):
         opt_list=[]
         for decoder in self.decoders:
-            optimizer = torch.optim.Adam(decoder.parameters(), lr=10 ** (-4), betas=(0.5, 0.9))
-            opt_list.add(optimizer)
-
+            optimizer = torch.optim.Adam(decoder.parameters())
+            opt_list.append(optimizer)
+            
+        opt_list.append(torch.optim.Adam(self.encoder.parameters()))
         # return the list of optimizers and second empty list is for schedulers (if any)
         return opt_list, []
 
@@ -246,7 +266,7 @@ class MVAE(pl.LightningModule):
         return self.encoder(x)
 
     # def display(self):
-    #     fake = self.decoder(self.fixed_noise).detach()
+    #     fake = self.decoder(self.latent).detach()
     #     plt.figure(figsize=(10, 10))
     #     plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
     #     plt.savefig(f'VAE_current_result.png')
@@ -257,25 +277,32 @@ class MVAE(pl.LightningModule):
     def training_step(self, batch, batch_idx, optimizer_idx):
         # batch returns x and y tensors
         real_images, _ = batch
-
+       
         #for the gpu
-        if self.t==0:
-            self.fixed_noise = self.fixed_noise.type_as(real_images[0])
+        if self.t==1:
+            self.latent = self.latent.type_as(real_images[0])
+            self.history=self.history.type_as(real_images[0])
+            self.NbDraws=self.NbDraws.type_as(real_images[0])
 
         #encoding
+        
         mu, log_var = self.encoder(real_images)
-        z = self.reparameterize(mu, log_var)
-
+        mu=mu.type_as(real_images[0])
+        log_var=log_var.type_as(real_images[0])
+        z = self.reparameterize(mu, log_var).type_as(real_images[0])
+        # print('OK1')
         with torch.no_grad():
             best_reward=10**(8)
+            
             for decoder in self.decoders:
-                recons=decoder(z)
+                
+                recons=decoder(z).type_as(real_images[0])
                 reward=self.loss_function(recons, real_images, mu, log_var)['Reconstruction_Loss']
                 if reward<best_reward:
                     best_reward=reward
 
             self.best_rewards.append(best_reward)
-
+        
         #initialization
         if self.t<self.nb_decoders:
             id_to_choose=self.t
@@ -288,16 +315,27 @@ class MVAE(pl.LightningModule):
                 self.NbDraws[id_to_choose] += 1
             else:
                 average_previous_rewards=self.history/self.NbDraws
-                id_to_choose=np.argmin(average_previous_rewards)
+                id_to_choose=torch.argmin(average_previous_rewards).item()
+                self.NbDraws[id_to_choose] += 1
 
         # Encoder-Decoder
-        recons = self.decoder[id_to_choose](z)
+        recons = self.decoders[id_to_choose](z).type_as(real_images[0])
         step_dict = self.loss_function(recons, real_images, mu, log_var)
+        
         self.history[id_to_choose]+=step_dict['Reconstruction_Loss']
         self.strategy_path.append(step_dict['Reconstruction_Loss'])
         total_loss = step_dict['total_loss']
+        
+        if self.t % 100 == 0:
+            fake = self.decoders[id_to_choose](self.latent).detach()
+            plt.figure(figsize=(10, 10))
+            plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
+            plt.savefig(f'VAE_current_result_decoder={id_to_choose}.png')
+            plt.close('all')
 
-        if optimizer_idx==id_to_choose:
+        self.t += 1
+
+        if (optimizer_idx in [id_to_choose,self.nb_decoders]):
             # {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
             output = OrderedDict({
                 'loss': total_loss,
@@ -307,20 +345,12 @@ class MVAE(pl.LightningModule):
 
             return output
 
-        if self.cpt % 100 == 0:
-            fake = self.decoder[id_to_choose](self.fixed_noise).detach()
-            plt.figure(figsize=(10, 10))
-            plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
-            plt.savefig(f'VAE_current_result_decoder={id_to_choose}.png')
-            plt.close('all')
-
-        self.t += 1
-
-    # calls after every epoch ends
-    def on_epoch_end(self):
-        fake = self.decoder(self.fixed_noise).detach()
-        plt.figure(figsize=(10, 10))
-        plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
-        plt.savefig(f'VAE_epoch_fashion_{self.i}.png')
-        plt.close('all')
-        self.i += 1
+        
+    # # calls after every epoch ends
+    # def on_epoch_end(self):
+    #     fake = self.decoder(self.latent).detach()
+    #     plt.figure(figsize=(10, 10))
+    #     plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
+    #     plt.savefig(f'VAE_epoch_fashion_{self.i}.png')
+    #     plt.close('all')
+    #     self.i += 1
