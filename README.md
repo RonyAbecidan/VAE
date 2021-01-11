@@ -31,3 +31,15 @@ pip install -r requirements.txt
 A part of the code is inspired by the VAEs presented in [this repo](https://github.com/AntixK/PyTorch-VAE).
 
 If you want to see more impressive implementations of VAEs in pytorch-lightning, I advise you to check it =)
+
+***
+
+Exemple of satisfying results obtained for the MNIST Dataset and the FashionMNIST Dataset :
+
+## MNIST
+
+![](https://i.imgur.com/DRF7KUL.png) 
+
+## FashionMNIST
+
+![](https://i.imgur.com/0ufAj6q.png) 
