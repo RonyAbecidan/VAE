@@ -6,7 +6,7 @@ This repository is made as part of an assignment for the "Bayesian Learning" cla
 
 Here, I am studying the pionneering paper of VAEs called [**"Auto-Encoding Variational Bayes"**](https://arxiv.org/abs/1312.6114) written by Diederik P. Kingma and Max Welling 
 
-In this paper, the authors proposes a **'stochastic variational inference and learning algorithm that scales to large dataset'** which corresponds to the first VAE model. In practice, the algorithm proposed in this paper can be applied to tasks of different kinds such as denoising, impainting and super-resolution. In this work, I treat exclusively the generative purpose since it's the most famous application of VAEs and it's also the kind of task chosen by the authors for their experiments.
+In this paper, the authors propose a **'stochastic variational inference and learning algorithm that scales to large dataset'** which corresponds to the first VAE model. In practice, the algorithm described in this paper can be applied to tasks of different kinds such as denoising, impainting and super-resolution. In this work, I treat exclusively the generative purpose since it's the most famous application of VAEs and it's also the kind of task chosen by the authors for their experiments.
 
 ***
 
