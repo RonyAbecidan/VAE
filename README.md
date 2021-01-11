@@ -1,6 +1,6 @@
 ## Study of the Variational Auto-Encoder
 
-This repository is made as part of an assignment for the "Bayesian Learning" class of the [University of Lille's Msc. in Data Science](bit.ly/MasterDSULille).
+This repository is made as part of an assignment for the "Bayesian Learning" class of the [University of Lille's Msc. in Data Science](http://bit.ly/MasterDSULille).
 
 #### Author : Rony Abecidan
 
