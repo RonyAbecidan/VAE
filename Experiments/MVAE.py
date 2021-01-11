@@ -223,6 +223,9 @@ class Decoder_Linear_Conv(pl.LightningModule):
 # Decoders=nn.ModuleList([Decoder_MLP(latent_dim=100, in_channel=1, im_size=32, hiddens=[256,512]),
 #           Decoder_Conv(latent_dim=100, in_channel=1, im_size=32, hiddens=[512,256,128],init=4),
 #           Decoder_Linear_Conv(latent_dim=100, in_channel=1, im_size=32, hiddens=[512,256,128,64],init=2)])
+# cuda0 = torch.device('cuda:0')
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class MabVAE(pl.LightningModule):
     def __init__(self,train_loader,decoders,eps=0.1,i=0):
@@ -247,16 +250,16 @@ class MabVAE(pl.LightningModule):
         self.in_channel=self.decoders[0].in_channel
         self.encoder = Encoder(latent_dim=self.latent_dim,in_channel=decoders[0].in_channel,im_size=self.im_size)
         #tensor storing information about the number of times a decoder is chosen and the reward associated
-        self.history=torch.zeros(self.nb_decoders)
-        self.NbDraws=torch.zeros(self.nb_decoders)
+        self.history=torch.zeros(self.nb_decoders).to(device)
+        self.NbDraws=torch.zeros(self.nb_decoders).to(device)
         #list for storing the reconstruction losses obtained through the time following our strategy
         self.strategy_path=[]
         self.train_loader = train_loader
         #list for storing the best rewards obtainable at each round 
         self.best_rewards=[]
-        self.latent = torch.randn(64, self.latent_dim, 1, 1)
+        self.latent = torch.randn(64, self.latent_dim, 1, 1).to(device)
         self.i=i #counter of epochs
-        self.t=1 #counter of steps
+        self.t=0 #counter of steps
 
     def reparameterize(self, mu, logvar):
         """
@@ -307,40 +310,16 @@ class MabVAE(pl.LightningModule):
 
     def forward(self, x):
         return self.encoder(x)
-
-    # Training Loop
-    def training_step(self, batch, batch_idx, optimizer_idx):
-        # batch returns x and y tensors
-        real_images, _ = batch
-       
-        #enable to activate the computations on the gpu
-        if self.t==1:
-            self.latent = self.latent.type_as(real_images[0])
-            self.history=self.history.type_as(real_images[0])
-            self.NbDraws=self.NbDraws.type_as(real_images[0])
-
-        #encoding
-        mu, log_var = self.encoder(real_images)
-        mu=mu.type_as(real_images[0])
-        log_var=log_var.type_as(real_images[0])
         
-        #sampling of the latent variable
-        z = self.reparameterize(mu, log_var).type_as(real_images[0])
-       
-        with torch.no_grad():
-            best_reward=-10**(10)
-            
-            #Computation of the best reward achievable at time t
-            for decoder in self.decoders:
-                recons=decoder(z).type_as(real_images[0])
-                reward=-self.loss_function(recons, real_images, mu, log_var)['Reconstruction_Loss']
-                if reward>best_reward:
-                    best_reward=reward
-
-            self.best_rewards.append(best_reward)
+    def backward(self, loss,optimizer,optimizer_idx):
+        loss.backward()
+        
+    # calls before every train step tart
+    def on_train_batch_start(self,batch,batch_idx,dataloader_idx):
         
         #initialization of all the decoders
-        if self.t<100*(self.nb_decoders):
+        #at the first epoch, they all have the same probability to be selected
+        if self.i==0:
             id_to_choose=np.random.randint(self.nb_decoders)
             self.NbDraws[id_to_choose]+=1
             
@@ -354,32 +333,88 @@ class MabVAE(pl.LightningModule):
                 average_previous_rewards=(self.history/self.NbDraws)
                 id_to_choose=torch.argmax(average_previous_rewards).item()
                 self.NbDraws[id_to_choose] += 1
-
-        # Encoder-Decoder
-        recons = self.decoders[id_to_choose](z).type_as(real_images[0])
-        step_dict = self.loss_function(recons, real_images, mu, log_var)
+                
+        self.id_to_choose=id_to_choose
         
-        self.history[id_to_choose]-=step_dict['Reconstruction_Loss']
-        self.strategy_path.append(-step_dict['Reconstruction_Loss'])
-        total_loss = step_dict['total_loss']
         
-        # periodic save in order to monitor the evolution of the training for the decoders
-        if self.t % 100 == 0:
-            fake = self.decoders[id_to_choose](self.latent).detach()
-            plt.figure(figsize=(10, 10))
-            plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
-            plt.savefig(f'VAE_current_result_decoder={id_to_choose}.png')
-            plt.close('all')
+    # Training Loop
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        if optimizer_idx==self.id_to_choose:
+            # batch returns x and y tensors
+            real_images, _ = batch
+            
+            #encoding
+            mu, log_var = self.encoder(real_images)
+            mu=mu.type_as(real_images[0])
+            log_var=log_var.type_as(real_images[0])
+            
+            #sampling of the latent variable
+            z = self.reparameterize(mu, log_var).type_as(real_images[0])
+            id_to_choose=self.id_to_choose
+            
+            #Computation of the best reward obtainable at time t with respect to all the possible decoders
+            #**********
+            with torch.no_grad():
+                best_reward=-10**(10)
+                
+                #Computation of the best reward achievable at time t
+                for decoder in self.decoders:
+                    recons=decoder(z).type_as(real_images[0])
+                    reward=-self.loss_function(recons,real_images,mu,log_var)['Reconstruction_Loss']
+                    if reward>best_reward:
+                        best_reward=reward
+    
+            self.best_rewards.append(best_reward)
+            #***********
+            
+            # Reconstruction with the selected decoder
+            recons = self.decoders[id_to_choose](z).type_as(real_images[0])
+            step_dict = self.loss_function(recons,real_images,mu,log_var)
 
-        self.t += 1
+            self.history[id_to_choose]-=step_dict['Reconstruction_Loss']
+            self.strategy_path.append(-step_dict['Reconstruction_Loss'])
+            
+            # periodic save in order to monitor the evolution of the training for the decoders
+            if self.t % 100 == 0:
+                fake = self.decoders[id_to_choose](self.latent).detach()
+                plt.figure(figsize=(10, 10))
+                plt.imshow(np.transpose(utils.make_grid(fake, padding=2, normalize=True).cpu(), (1, 2, 0)))
+                plt.savefig(f'VAE_current_result_decoder={id_to_choose}.png')
+                plt.close('all')
 
-        #We update only the parameters of the chosen decoder
-        if (optimizer_idx in [id_to_choose,self.nb_decoders]):
-            # {'loss': loss, 'Reconstruction_Loss':recons_loss, 'KLD':-kld_loss}
+            
+            #We update the parameters of the chosen decoder 
+            
             output = OrderedDict({
-                'loss': total_loss,
+                'loss': step_dict['total_loss'],
                 'progress_bar': step_dict,
                 'log': step_dict
             })
-
+            self.t += 1
+            
             return output
+        
+        if optimizer_idx==self.nb_decoders:
+            real_images, _ = batch
+            mu, log_var = self.encoder(real_images)
+            mu=mu.type_as(real_images[0])
+            log_var=log_var.type_as(real_images[0])
+            #sampling of the latent variable
+            z = self.reparameterize(mu, log_var).type_as(real_images[0])
+            # Reconstruction with the selected decoder
+            recons = self.decoders[self.id_to_choose](z).type_as(real_images[0])
+            step_dict = self.loss_function(recons,real_images,mu,log_var)
+            #We update the parameters of the encoder
+            output = OrderedDict({
+                'loss': step_dict['total_loss'],
+                'progress_bar': step_dict,
+                'log': step_dict
+            })
+            
+            return output
+            
+            
+       
+    # calls after every epoch ends
+    def on_epoch_end(self):
+        self.i+=1
