@@ -1,4 +1,4 @@
-numpy==1.19.4
+numpy>=1.21
 torch==1.7.0+cu101
 matplotlib==3.2.2
 pytorch-lightning>1.5.8
